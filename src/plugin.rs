@@ -394,17 +394,21 @@ impl Instance {
             }
             self.inner.run(samples);
 
-            if let Some(interface) = self.worker_interface.as_mut() {
-                worker::handle_work_responses(
-                    interface,
-                    &mut self.worker_to_instance_receiver,
-                    self.inner.instance().handle(),
-                );
-                worker::end_run(interface, self.inner.instance().handle());
-            }
-
-            Ok(())
+            self.run_worker()
         }
+    }
+
+    pub fn run_worker(&mut self) -> Result<(), RunError> {
+        if let Some(interface) = self.worker_interface.as_mut() {
+            worker::handle_work_responses(
+                interface,
+                &mut self.worker_to_instance_receiver,
+                self.inner.instance().handle(),
+            );
+            worker::end_run(interface, self.inner.instance().handle());
+        }
+
+        Ok(())
     }
 
     /// Get the underlying `lilv::instance::ActiveInstance`.
