@@ -3,8 +3,6 @@ use lv2_sys::LV2_Options_Option;
 use std::convert::TryFrom;
 use std::{collections::HashMap, ffi::CStr};
 
-static OPTIONS_FEATURE_URI: &[u8] = b"http://lv2plug.in/ns/ext/options#options\0";
-
 const EMPTY_OPTION: LV2_Options_Option = LV2_Options_Option {
     context: 0,
     subject: 0,
@@ -17,27 +15,16 @@ const EMPTY_OPTION: LV2_Options_Option = LV2_Options_Option {
 pub struct Options {
     data: Vec<lv2_sys::LV2_Options_Option>,
     values: HashMap<LV2Urid, Box<i32>>,
-    feature: LV2Feature,
 }
 
 unsafe impl Send for Options {}
 
 impl Options {
     pub fn new() -> Options {
-        let mut options = Options {
+        Self {
             data: vec![EMPTY_OPTION],
             values: HashMap::new(),
-            feature: LV2Feature {
-                uri: OPTIONS_FEATURE_URI.as_ptr().cast(),
-                data: std::ptr::null_mut(),
-            },
-        };
-        options.feature.data = options.data.as_mut_ptr().cast();
-        options
-    }
-
-    pub fn as_feature(&self) -> &LV2Feature {
-        &self.feature
+        }
     }
 
     pub fn set_int_option(
@@ -69,7 +56,13 @@ impl Options {
         self.data.pop(); // Remove the last `EMPTY_OPTION`.
         self.data.push(option);
         self.data.push(EMPTY_OPTION);
-        self.feature.data = self.data.as_mut_ptr().cast();
+    }
+
+    pub fn feature(&mut self) -> LV2Feature {
+        LV2Feature {
+            uri: lv2_sys::LV2_OPTIONS__options.as_ptr().cast(),
+            data: self.data.as_mut_ptr().cast(),
+        }
     }
 }
 

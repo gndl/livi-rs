@@ -215,6 +215,32 @@ impl World {
     pub fn build_features(&self, builder: crate::features::FeaturesBuilder) -> Arc<Features> {
         builder.build(self)
     }
+
+    /// Load a state snapshot from the world RDF model.
+    /// 
+    /// This function can be used to load the default state of a plugin by passing
+    /// the plugin URI as the `subject` parameter.
+    /// The `subject` of the state description can be a preset URI for instance.
+    pub fn new_state(&self, features: &mut crate::Features, subject: &lilv::node::Node) -> Option<lilv::state::State> {
+        features.visit_map(|_, map| self.world.new_state(map, subject))
+    }
+
+    /// Load a state snapshot from a file.
+    /// 
+    /// If `subject` is None, it is taken to be the URI of the file (i.e.
+    /// \"<>\" in Turtle).
+    /// 
+    /// This function parses the file indicated by `path` separately to create the state, it does not
+    /// parse the file into the world model, i.e. the returned state is the only
+    /// new memory consumed once this function returns.
+    pub fn new_state_from_file(&self, features: &mut crate::Features, subject: Option<&lilv::node::Node>, path: &str) -> Option<lilv::state::State> {
+        features.visit_map(|_, map| self.world.new_state_from_file(map, subject, path))
+    }
+
+    /// Load a state snapshot from a string made by [`crate::state::State::to_string()`].
+    pub fn new_state_from_string(&self, features: &mut crate::Features, string: &str) -> Option<lilv::state::State> {
+        features.visit_map(|_, map| self.world.new_state_from_string(map, string))
+    }
 }
 
 impl Default for World {

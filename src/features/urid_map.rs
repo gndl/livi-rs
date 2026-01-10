@@ -7,9 +7,6 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
-static URID_MAP: &[u8] = b"http://lv2plug.in/ns/ext/urid#map\0";
-static URID_UNMAP: &[u8] = b"http://lv2plug.in/ns/ext/urid#unmap\0";
-
 type MapImpl = Mutex<HashMap<CString, u32>>;
 
 /// # Safety
@@ -44,8 +41,6 @@ pub struct UridMap {
     map: MapImpl,
     map_data: lv2_raw::LV2UridMap,
     unmap_data: lv2_sys::LV2_URID_Unmap,
-    urid_map_feature: LV2Feature,
-    urid_unmap_feature: LV2Feature,
     _pin: std::marker::PhantomPinned,
 }
 
@@ -63,26 +58,14 @@ impl UridMap {
                 handle: std::ptr::null_mut(),
                 unmap: Some(do_unmap),
             },
-            urid_map_feature: LV2Feature {
-                uri: URID_MAP.as_ptr().cast(),
-                data: std::ptr::null_mut(),
-            },
-            urid_unmap_feature: LV2Feature {
-                uri: URID_UNMAP.as_ptr().cast(),
-                data: std::ptr::null_mut(),
-            },
             _pin: std::marker::PhantomPinned,
         });
         let map_impl_ptr = NonNull::from(&urid_map.map);
-        let map_data_ptr = NonNull::from(&urid_map.map_data);
-        let unmap_data_ptr = NonNull::from(&urid_map.unmap_data);
         unsafe {
             let mut_ref_pin: Pin<&mut UridMap> = Pin::as_mut(&mut urid_map);
             let mut_ref = Pin::get_unchecked_mut(mut_ref_pin);
             mut_ref.map_data.handle = map_impl_ptr.as_ptr().cast();
             mut_ref.unmap_data.handle = map_impl_ptr.as_ptr().cast();
-            mut_ref.urid_map_feature.data = map_data_ptr.as_ptr().cast();
-            mut_ref.urid_unmap_feature.data = unmap_data_ptr.as_ptr().cast();
         }
         urid_map
     }
@@ -104,12 +87,24 @@ impl UridMap {
         }
     }
 
-    pub fn as_urid_map_feature(&self) -> &LV2Feature {
-        &self.urid_map_feature
+    pub fn urid_map_feature(&self) -> LV2Feature {
+        let map_data_ptr = NonNull::from(&self.map_data);
+        LV2Feature {
+            uri: lv2_sys::LV2_URID__map.as_ptr().cast(),
+            data: map_data_ptr.as_ptr().cast(),
+        }
     }
 
-    pub fn as_urid_unmap_feature(&self) -> &LV2Feature {
-        &self.urid_unmap_feature
+    pub fn urid_unmap_feature(&self) -> LV2Feature {
+        let unmap_data_ptr = NonNull::from(&self.unmap_data);
+        LV2Feature {
+            uri: lv2_sys::LV2_URID__unmap.as_ptr().cast(),
+            data: unmap_data_ptr.as_ptr().cast(),
+        }
+    }
+
+    pub fn urid_map(&mut self) -> &mut lv2_raw::LV2UridMap {
+        &mut self.map_data
     }
 }
 
