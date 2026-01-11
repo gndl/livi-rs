@@ -243,7 +243,7 @@ impl Plugin {
     /// LV2 State extension for details on the `flags` and `features` parameters.
     pub fn new_state_from_instance(
         &self,
-        features: &mut crate::Features,
+        features: &crate::Features,
         instance: &Instance,
         file_dir: Option<&str>,
         copy_dir: Option<&str>,
@@ -270,7 +270,7 @@ impl Plugin {
 
     pub fn instance_state_string(
         &self,
-        features: &mut crate::Features,
+        features: &crate::Features,
         instance: &Instance,
         file_dir: Option<&str>,
         copy_dir: Option<&str>,
