@@ -1,6 +1,7 @@
 use crate::WorkerManager;
 use lv2_raw::LV2Feature;
 use std::pin::Pin;
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::{collections::HashSet, ffi::CStr};
@@ -45,7 +46,7 @@ impl FeaturesBuilder {
         });
 
         let mut features = Features {
-            urid_map: urid_map::UridMap::new(),
+            urid_map: RefCell::new(urid_map::UridMap::new()),
             options: options::Options::new(),
             min_block_length: self.min_block_length,
             max_block_length: self.max_block_length,
@@ -54,40 +55,42 @@ impl FeaturesBuilder {
             keep_worker_thread_alive,
             collection: Vec::new(),
         };
+        {
+            let urid_map = features.urid_map.borrow();
 
-        features.collection.push(features.urid_map.urid_map_feature());
-        features.collection.push(features.urid_map.urid_unmap_feature());
+            features.collection.push(urid_map.urid_map_feature());
+            features.collection.push(urid_map.urid_unmap_feature());
 
-        features.collection.push(LV2Feature {
-            uri: lv2_sys::LV2_BUF_SIZE__boundedBlockLength.as_ptr().cast(),
-            data: std::ptr::null_mut(),
-        });
+            features.collection.push(LV2Feature {
+                uri: lv2_sys::LV2_BUF_SIZE__boundedBlockLength.as_ptr().cast(),
+                data: std::ptr::null_mut(),
+            });
 
-        features.options.set_int_option(
-            &features.urid_map,
-            features.urid_map.map(
-                CStr::from_bytes_with_nul(b"http://lv2plug.in/ns/ext/buf-size#minBlockLength\0")
-                    .unwrap(),
-            ),
-            self.min_block_length as i32,
-        );
-        features.options.set_int_option(
-            &features.urid_map,
-            features.urid_map.map(
-                CStr::from_bytes_with_nul(b"http://lv2plug.in/ns/ext/buf-size#maxBlockLength\0")
-                    .unwrap(),
-            ),
-            self.max_block_length as i32,
-        );
-        features.collection.push(features.options.feature());
-
+            features.options.set_int_option(
+                &urid_map,
+                urid_map.map(
+                    CStr::from_bytes_with_nul(b"http://lv2plug.in/ns/ext/buf-size#minBlockLength\0")
+                        .unwrap(),
+                ),
+                self.min_block_length as i32,
+            );
+            features.options.set_int_option(
+                &urid_map,
+                urid_map.map(
+                    CStr::from_bytes_with_nul(b"http://lv2plug.in/ns/ext/buf-size#maxBlockLength\0")
+                        .unwrap(),
+                ),
+                self.max_block_length as i32,
+            );
+            features.collection.push(features.options.feature());
+        }
         Arc::new(features)
     }
 }
 
 /// `Features` are used to provide functionality to plugins.
 pub struct Features {
-    urid_map: Pin<Box<urid_map::UridMap>>,
+    urid_map: RefCell<Pin<Box<urid_map::UridMap>>>,
     options: options::Options,
     min_block_length: usize,
     max_block_length: usize,
@@ -137,7 +140,7 @@ impl Features {
 
     /// The urid for the given uri.
     pub fn urid(&self, uri: &CStr) -> u32 {
-        self.urid_map.map(uri)
+        self.urid_map.borrow().map(uri)
     }
 
     /// The urid for midi.
@@ -149,8 +152,9 @@ impl Features {
     }
 
     /// The uri for the given urid.
-    pub fn uri(&self, urid: lv2_raw::LV2Urid) -> Option<&str> {
-        self.urid_map.unmap(urid)
+    pub fn uri(&self, urid: lv2_raw::LV2Urid) -> Option<String> {
+        let urid_map = self.urid_map.borrow();
+        urid_map.unmap(urid).map(|uri| uri.to_string())
     }
 
     /// The worker manager. This is automatically run periodically to perform
@@ -159,12 +163,13 @@ impl Features {
         &self.worker_manager
     }
 
-    pub fn visit<F, R>(&mut self, mut f: F) -> R
+    pub fn visit<F, R>(&self, mut f: F) -> R
     where
         F: FnMut(&Vec<LV2Feature>, &mut lv2_raw::LV2UridMap, &mut lv2_sys::LV2_URID_Unmap) -> R,
     {
+        let mut urid_map = self.urid_map.borrow_mut();
         unsafe {
-            let mut_ref_pin = Pin::as_mut(&mut self.urid_map);
+            let mut_ref_pin = Pin::as_mut(&mut urid_map);
             let mut_ref = Pin::get_unchecked_mut(mut_ref_pin);
 
             mut_ref.visit(|map, unmap| f(&self.collection, map, unmap))
