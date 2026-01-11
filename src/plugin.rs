@@ -253,7 +253,7 @@ impl Plugin {
         flags: lv2_sys::LV2_State_Flags,
     ) -> Option<lilv::state::State>
     {
-        features.visit_map(|features, map|
+        features.visit(|features, map, _|
             self.inner.new_state_from_instance(
                 instance.inner.instance(),
                 map,
@@ -266,6 +266,35 @@ impl Plugin {
                 features,
             )
         )
+    }
+
+    pub fn instance_state_string(
+        &self,
+        features: &mut crate::Features,
+        instance: &Instance,
+        file_dir: Option<&str>,
+        copy_dir: Option<&str>,
+        link_dir: Option<&str>,
+        save_dir: Option<&str>,
+        _user: Option<&mut dyn lilv::state::GetPortValue>,
+        flags: lv2_sys::LV2_State_Flags,
+    ) -> Option<String>
+    {
+        features.visit(|features, map, unmap| {
+            let state = self.inner.new_state_from_instance(
+                instance.inner.instance(),
+                map,
+                file_dir,
+                copy_dir,
+                link_dir,
+                save_dir,
+                None,
+                flags,
+                features,
+            )?;
+            
+            state.to_string(map, unmap, self.inner.uri().as_str().unwrap(), None)
+        })
     }
 }
 

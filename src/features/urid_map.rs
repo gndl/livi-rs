@@ -103,8 +103,11 @@ impl UridMap {
         }
     }
 
-    pub fn urid_map(&mut self) -> &mut lv2_raw::LV2UridMap {
-        &mut self.map_data
+    pub fn visit<F, R>(&mut self, mut f: F) -> R
+    where
+        F: FnMut(&mut lv2_raw::LV2UridMap, &mut lv2_sys::LV2_URID_Unmap) -> R,
+    {
+        f(&mut self.map_data, &mut self.unmap_data)
     }
 }
 

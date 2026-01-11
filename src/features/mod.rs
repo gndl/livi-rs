@@ -159,25 +159,17 @@ impl Features {
         &self.worker_manager
     }
 
-    pub fn urid_map(&mut self) -> &mut lv2_raw::LV2UridMap {
-        unsafe {
-            let mut_ref_pin = Pin::as_mut(&mut self.urid_map);
-            let mut_ref = Pin::get_unchecked_mut(mut_ref_pin);
-            mut_ref.urid_map()
-        }
-    }
-
-    pub fn visit_map<F, R>(&mut self, mut f: F) -> R
+    pub fn visit<F, R>(&mut self, mut f: F) -> R
     where
-        F: FnMut(&Vec<LV2Feature>, &mut lv2_raw::LV2UridMap) -> R,
+        F: FnMut(&Vec<LV2Feature>, &mut lv2_raw::LV2UridMap, &mut lv2_sys::LV2_URID_Unmap) -> R,
     {
         unsafe {
             let mut_ref_pin = Pin::as_mut(&mut self.urid_map);
             let mut_ref = Pin::get_unchecked_mut(mut_ref_pin);
-            f(&self.collection, mut_ref.urid_map())
+
+            mut_ref.visit(|map, unmap| f(&self.collection, map, unmap))
         }
     }
-
 }
 
 impl std::fmt::Debug for Features {
