@@ -177,7 +177,7 @@ impl Plugin {
                 _worker_schedule: worker_schedule,
                 _instance_to_worker_sender: instance_to_worker_sender,
                 is_alive,
-                _features: features,
+                features,
             })
         }
     }
@@ -195,106 +195,6 @@ impl Plugin {
     /// Return all ports with the given type.
     pub fn ports_with_type(&self, port_type: PortType) -> impl '_ + Iterator<Item = Port> {
         self.ports().filter(move |p| p.port_type == port_type)
-    }
-
-    /// Create a new state snapshot from a plugin instance.
-    /// 
-    /// The `file_dir` directory is for hosts that support file creation at any time with state
-    /// state:makePath.  These files will be copied as necessary to `copy_dir` and
-    /// not be referred to directly in state (a temporary directory is appropriate).
-    /// 
-    /// The `copy_dir` directory will have the same structure as `file_dir` but with possibly
-    /// modified file names to distinguish different revisions.  If you only care
-    /// about saving one state snapshot, it can be the same as `save_dir`.  Plugin
-    /// state will refer to files in this directory.
-    /// 
-    /// If the state will be saved, `save_dir` should be the bundle directory later passed
-    /// to [`crate::state::State::save()`].
-    /// 
-    /// If `user` is not provided, the returned state will not represent port values.
-    /// `user` should only be omited in hosts that save and restore port values via some other mechanism.
-    /// 
-    /// A link will be made in the `link_dir` directory to any external files referred to in plugin state.
-    /// In turn, links will be created in the save directory to these links (e.g.
-    /// save_dir/file => link_dir/file => /foo/bar/file).  This allows many state
-    /// snapshots to share a single link to an external file, so archival
-    /// (e.g. with tar -h) will not create several copies of the file.  If this is
-    /// not required, it can be the same as `save_dir`.
-    /// 
-    /// This function may be called simultaneously with any instance function
-    /// (except discovery functions) unless the threading class of that function
-    /// explicitly disallows this.
-    /// 
-    /// To support advanced file functionality, there are several directory
-    /// parameters.  Simple hosts that only wish to save a single plugins state once
-    /// may simply use the same directory for all of them (or pass None to not
-    /// support files at all).  The multiple parameters are necessary to support
-    /// saving an instances state many times while avoiding any duplication of data.
-    /// 
-    /// If supported (via state:makePath passed to LV2_Descriptor::instantiate()),
-    /// `file_dir` should be the directory where any files created by the plugin
-    /// (not during save time, e.g. during instantiation) are stored.  These files
-    /// will be copied to preserve their state at this time.plugin-created files are stored.
-    /// Lilv will assume any files within this directory (recursively) are created
-    /// by the plugin and all other files are immutable.  Note that this function
-    /// does not save the state, use [`crate::state::State::save()`] for that.
-    /// 
-    /// See <a href=https://lv2plug.in/ns/ext/state>LV2 state</a> from the
-    /// LV2 State extension for details on the `flags` and `features` parameters.
-    pub fn new_state_from_instance(
-        &self,
-        features: &crate::Features,
-        instance: &Instance,
-        file_dir: Option<&str>,
-        copy_dir: Option<&str>,
-        link_dir: Option<&str>,
-        save_dir: Option<&str>,
-        _user: Option<&mut dyn lilv::state::GetPortValue>,
-        flags: lv2_sys::LV2_State_Flags,
-    ) -> Option<lilv::state::State>
-    {
-        features.visit(|features, map, _|
-            self.inner.new_state_from_instance(
-                instance.inner.instance(),
-                map,
-                file_dir,
-                copy_dir,
-                link_dir,
-                save_dir,
-                None,
-                flags,
-                features,
-            )
-        )
-    }
-
-    pub fn instance_state_string(
-        &self,
-        features: &crate::Features,
-        instance: &Instance,
-        file_dir: Option<&str>,
-        copy_dir: Option<&str>,
-        link_dir: Option<&str>,
-        save_dir: Option<&str>,
-        _user: Option<&mut dyn lilv::state::GetPortValue>,
-        flags: lv2_sys::LV2_State_Flags,
-    ) -> Option<String>
-    {
-        features.visit(|features, map, unmap| {
-            let state = self.inner.new_state_from_instance(
-                instance.inner.instance(),
-                map,
-                file_dir,
-                copy_dir,
-                link_dir,
-                save_dir,
-                None,
-                flags,
-                features,
-            )?;
-            
-            state.to_string(map, unmap, self.inner.uri().as_str().unwrap(), None)
-        })
     }
 }
 
@@ -351,7 +251,7 @@ pub struct Instance {
     _worker_schedule: Box<lv2_sys::LV2_Worker_Schedule>,
     _instance_to_worker_sender: Box<worker::WorkerMessageSender>,
     is_alive: Arc<Mutex<bool>>,
-    _features: Arc<Features>,
+    features: Arc<Features>,
 }
 
 unsafe impl Sync for Instance {}
@@ -583,6 +483,135 @@ impl Instance {
             cv_outputs: self.port_counts_for_type(PortType::CVOutput),
         }
     }
+
+    /// Create a new state snapshot from a plugin instance.
+    /// 
+    /// The `file_dir` directory is for hosts that support file creation at any time with state
+    /// state:makePath.  These files will be copied as necessary to `copy_dir` and
+    /// not be referred to directly in state (a temporary directory is appropriate).
+    /// 
+    /// The `copy_dir` directory will have the same structure as `file_dir` but with possibly
+    /// modified file names to distinguish different revisions.  If you only care
+    /// about saving one state snapshot, it can be the same as `save_dir`.  Plugin
+    /// state will refer to files in this directory.
+    /// 
+    /// If the state will be saved, `save_dir` should be the bundle directory later passed
+    /// to [`crate::state::State::save()`].
+    /// 
+    /// If `user` is not provided, the returned state will not represent port values.
+    /// `user` should only be omited in hosts that save and restore port values via some other mechanism.
+    /// 
+    /// A link will be made in the `link_dir` directory to any external files referred to in plugin state.
+    /// In turn, links will be created in the save directory to these links (e.g.
+    /// save_dir/file => link_dir/file => /foo/bar/file).  This allows many state
+    /// snapshots to share a single link to an external file, so archival
+    /// (e.g. with tar -h) will not create several copies of the file.  If this is
+    /// not required, it can be the same as `save_dir`.
+    /// 
+    /// This function may be called simultaneously with any instance function
+    /// (except discovery functions) unless the threading class of that function
+    /// explicitly disallows this.
+    /// 
+    /// To support advanced file functionality, there are several directory
+    /// parameters.  Simple hosts that only wish to save a single plugins state once
+    /// may simply use the same directory for all of them (or pass None to not
+    /// support files at all).  The multiple parameters are necessary to support
+    /// saving an instances state many times while avoiding any duplication of data.
+    /// 
+    /// If supported (via state:makePath passed to LV2_Descriptor::instantiate()),
+    /// `file_dir` should be the directory where any files created by the plugin
+    /// (not during save time, e.g. during instantiation) are stored.  These files
+    /// will be copied to preserve their state at this time.plugin-created files are stored.
+    /// Lilv will assume any files within this directory (recursively) are created
+    /// by the plugin and all other files are immutable.  Note that this function
+    /// does not save the state, use [`crate::state::State::save()`] for that.
+    /// 
+    /// See <a href=https://lv2plug.in/ns/ext/state>LV2 state</a> from the
+    /// LV2 State extension for details on the `flags` and `features` parameters.
+    pub fn state(
+        &self,
+        plugin: &Plugin,
+        file_dir: Option<&str>,
+        copy_dir: Option<&str>,
+        link_dir: Option<&str>,
+        save_dir: Option<&str>,
+        _user: Option<&mut dyn lilv::state::GetPortValue>,
+        flags: lv2_sys::LV2_State_Flags,
+    ) -> Option<lilv::state::State>
+    {
+        self.features.visit(|features, map, _|
+            plugin.inner.new_state_from_instance(
+                self.inner.instance(),
+                map,
+                file_dir,
+                copy_dir,
+                link_dir,
+                save_dir,
+                None,
+                flags,
+                features,
+            )
+        )
+    }
+
+    pub fn state_string(
+        &self,
+        plugin: &Plugin,
+        file_dir: Option<&str>,
+        copy_dir: Option<&str>,
+        link_dir: Option<&str>,
+        save_dir: Option<&str>,
+        _user: Option<&mut dyn lilv::state::GetPortValue>,
+        flags: lv2_sys::LV2_State_Flags,
+    ) -> Option<String>
+    {
+        self.features.visit(|features, map, unmap| {
+            let state = plugin.inner.new_state_from_instance(
+                self.inner.instance(),
+                map,
+                file_dir,
+                copy_dir,
+                link_dir,
+                save_dir,
+                None,
+                flags,
+                features,
+            )?;
+            
+            state.to_string(map, unmap, plugin.inner.uri().as_str().unwrap(), None)
+        })
+    }
+
+    /// Restore state from a snapshot.
+    /// 
+    /// This will set all the properties of `instance`, if given, to the values
+    /// stored in the state.  If `user` is provided, [`crate::state::SetPortValue::set_port_value()`] will be called to restore each port value, otherwise the host must
+    /// restore the port values itself (using [`emit_port_values`](#method.emit_port_values)) in order
+    /// to completely restore the state.
+    /// 
+    /// If the state has properties and `instance` is given, this function is in
+    /// the \"instantiation\" threading class, i.e. it MUST NOT be called
+    /// simultaneously with any function on the same plugin instance.
+    /// 
+    /// If the state has no properties, only port values are set via [`crate::state::SetPortValue::set_port_value()`].
+    /// 
+    /// See <a href=https://lv2plug.in/ns/ext/state>LV2 state</a> from the
+    /// LV2 State extension for details on the `flags` and `features` parameters.
+    pub fn restore_state(
+        &self,
+        state: &lilv::state::State,
+        _user: Option<&mut dyn lilv::state::SetPortValue>,
+        flags: lv2_sys::LV2_State_Flags,
+    ) {
+        self.features.visit(|features, map, unmap| {
+            state.restore(
+                self.raw().instance(),
+                None,
+                flags,
+                features,
+            );
+        })
+    }
 }
 
 impl Debug for Instance {
@@ -604,7 +633,7 @@ impl Debug for Instance {
             .field("_worker_schedule", &self._worker_schedule)
             .field("_instance_to_worker_sender", &"__ringbuf_sender__")
             .field("is_alive", &self.is_alive)
-            .field("_features", &self._features)
+            .field("_features", &self.features)
             .finish()
     }
 }
