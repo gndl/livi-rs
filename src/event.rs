@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 
 /// A builder for a single atom event. The max size of the data contained in the
 /// event is `MAX_SIZE`.
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct LV2AtomEventBuilder<const MAX_SIZE: usize> {
     /// The atom event.
     event: lv2_raw::LV2AtomEvent,
@@ -40,7 +40,7 @@ impl<const MAX_SIZE: usize> LV2AtomEventBuilder<MAX_SIZE> {
                 time_in_frames,
                 body: LV2Atom {
                     size: u32::try_from(data.len()).expect("Size exceeds u32 capacity."),
-                    mytype: my_type,
+                    type_: my_type,
                 },
             },
             _data: buffer,
@@ -58,7 +58,7 @@ impl<const MAX_SIZE: usize> LV2AtomEventBuilder<MAX_SIZE> {
                 time_in_frames,
                 body: LV2Atom {
                     size: MAX_SIZE as u32,
-                    mytype: my_type,
+                    type_: my_type,
                 },
             },
             _data: data,
@@ -96,6 +96,11 @@ impl<const MAX_SIZE: usize> Debug for LV2AtomEventBuilder<MAX_SIZE> {
 }
 
 /// An atom sequence.
+///
+/// When passing sequences to a plugin, use the same [`crate::Features`] as for
+/// plugin instantiation so atom types share a URID mapping. Native writers must
+/// honor the buffer capacity and leave valid sequence and event sizes; iteration
+/// trusts this structure and does not validate arbitrary native output.
 pub struct LV2AtomSequence {
     atom_sequence_urid: lv2_raw::LV2Urid,
     atom_chunk_urid: lv2_raw::LV2Urid,
@@ -115,14 +120,8 @@ impl LV2AtomSequence {
     #[must_use]
     pub fn new(features: &crate::Features, capacity: usize) -> LV2AtomSequence {
         let mut seq = LV2AtomSequence {
-            atom_sequence_urid: features.urid(
-                std::ffi::CStr::from_bytes_with_nul(b"http://lv2plug.in/ns/ext/atom#Sequence\0")
-                    .unwrap(),
-            ),
-            atom_chunk_urid: features.urid(
-                std::ffi::CStr::from_bytes_with_nul(b"http://lv2plug.in/ns/ext/atom#Chunk\0")
-                    .unwrap(),
-            ),
+            atom_sequence_urid: features.urid(c"http://lv2plug.in/ns/ext/atom#Sequence"),
+            atom_chunk_urid: features.urid(c"http://lv2plug.in/ns/ext/atom#Chunk"),
             buffer: vec![0; capacity + std::mem::size_of::<lv2_raw::LV2AtomSequence>()],
         };
         seq.clear();
@@ -133,7 +132,7 @@ impl LV2AtomSequence {
     pub fn clear(&mut self) {
         unsafe {
             let seq = self.as_mut_ptr();
-            (*seq).atom.mytype = self.atom_sequence_urid;
+            (*seq).atom.type_ = self.atom_sequence_urid;
             (*seq).atom.size = std::mem::size_of::<lv2_raw::LV2AtomSequenceBody>() as u32;
         }
     }
@@ -143,7 +142,7 @@ impl LV2AtomSequence {
         let capacity = self.capacity() as u32;
         unsafe {
             let seq = self.as_mut_ptr();
-            (*seq).atom.mytype = self.atom_chunk_urid;
+            (*seq).atom.type_ = self.atom_chunk_urid;
             (*seq).atom.size = capacity;
         }
     }
@@ -159,14 +158,15 @@ impl LV2AtomSequence {
     ) -> Result<(), EventError> {
         let event_size =
             std::mem::size_of::<lv2_raw::LV2AtomEvent>() as u32 + event.event.body.size;
+        let padded_event_size = lv2_raw::lv2_atom_pad_size(event_size);
         let sequence = unsafe { &mut *self.as_mut_ptr() };
         // This size includes the atom sequence header.
         let current_sequence_size =
             std::mem::size_of_val(&sequence.atom) as u32 + sequence.atom.size;
-        if (self.buffer.len() as u32) < current_sequence_size + event_size {
+        if (self.buffer.len() as u32) < current_sequence_size + padded_event_size {
             return Err(EventError::SequenceFull {
                 capacity: self.capacity(),
-                requested: (current_sequence_size + event_size) as usize,
+                requested: (current_sequence_size + padded_event_size) as usize,
             });
         }
         let end = unsafe { lv2_raw::lv2_atom_sequence_end(&sequence.body, sequence.atom.size) }
@@ -174,8 +174,7 @@ impl LV2AtomSequence {
         let src_ptr: *const u8 = event.as_ptr().cast();
         let dst_ptr: *mut u8 = end.cast();
         unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, event_size as usize) };
-        // This size only includes the sequencey body.
-        sequence.atom.size += lv2_raw::lv2_atom_pad_size(event_size);
+        sequence.atom.size += padded_event_size;
         Ok(())
     }
 
@@ -201,6 +200,11 @@ impl LV2AtomSequence {
     }
 
     /// Return a mutable pointer to the underlying data.
+    ///
+    /// Writers must stay within the allocation, preserve valid atom headers and
+    /// padded event sizes, and respect Rust's borrowing rules. The pointer is
+    /// invalid after the sequence is dropped and must not be used while the
+    /// sequence is otherwise borrowed.
     #[must_use]
     pub fn as_mut_ptr(&mut self) -> *mut lv2_raw::LV2AtomSequence {
         self.buffer.as_mut_ptr().cast()
@@ -223,15 +227,16 @@ impl LV2AtomSequence {
 
     /// Iterate over all events (and event data) in the sequence.
     ///
-    /// # Panics
-    /// Panics if the underlying sequence is not well formed.
+    /// This method does not validate malformed native output. Code writing
+    /// through raw pointers must preserve the sequence's invariants; malformed
+    /// sizes can cause undefined behavior, rather than a panic.
     #[must_use]
     pub fn iter(&self) -> LV2AtomSequenceIter<'_> {
         unsafe {
             let seq = self.as_ptr();
             // Only sequences can be iterated over. Chunks are expected to be
             // passed to plugins and mutated into sequences.
-            if (*seq).atom.mytype != self.atom_sequence_urid {
+            if (*seq).atom.type_ != self.atom_sequence_urid {
                 return LV2AtomSequenceIter {
                     _sequence: PhantomData,
                     body: std::ptr::null(),
@@ -315,7 +320,7 @@ impl<'a> Debug for LV2AtomEventWithData<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LV2AtomEventWithData")
             .field("time_in_frames", &self.event.time_in_frames)
-            .field("my_type", &self.event.body.mytype)
+            .field("my_type", &self.event.body.type_)
             .field("size", &self.event.body.size)
             .field("data", &self.data)
             .finish()
@@ -333,10 +338,12 @@ mod tests {
     }
 
     fn test_features() -> Arc<crate::Features> {
-        TEST_WORLD.build_features(crate::features::FeaturesBuilder {
-            min_block_length: 1024,
-            max_block_length: 1024,
-        })
+        TEST_WORLD
+            .try_build_features(crate::features::FeaturesBuilder {
+                min_block_length: 1024,
+                max_block_length: 1024,
+            })
+            .expect("invalid feature block bounds")
     }
 
     #[test]
@@ -349,6 +356,24 @@ mod tests {
         assert_eq!(10, sequence.iter().count());
         for event in sequence.iter() {
             assert_eq!(event.data, &[0, 10, 20, 30, 40, 50, 60, 70]);
+        }
+    }
+
+    #[test]
+    fn test_padded_event_capacity_boundary() {
+        let features = test_features();
+        for capacity in 0..80 {
+            for size in 0..16 {
+                let event = LV2AtomEventBuilder::<16>::new(0, 0, &[1; 16][..size]).unwrap();
+                let mut sequence = LV2AtomSequence::new(&features, capacity);
+                while sequence.push_event(&event).is_ok() {
+                    assert!(
+                        sequence.size() <= sequence.buffer.len(),
+                        "capacity {capacity}, data size {size}"
+                    );
+                }
+                assert!(sequence.size() <= sequence.buffer.len());
+            }
         }
     }
 

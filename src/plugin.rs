@@ -1,4 +1,6 @@
 use std::boxed::Box;
+use std::collections::HashMap;
+use std::ffi::CStr;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
@@ -6,11 +8,13 @@ use crate::features::Features;
 use crate::port::{ControlPort, Controls};
 use crate::{
     CommonUris, Port, PortConnections, PortCounts, PortIndex, PortType,
-    error::{InstantiateError, RunError},
+    error::{InstantiateError, RunError, StateError},
     event::LV2AtomSequence,
     features::worker,
     port::{DataType, IOType},
+    state::{PortValueGetter, PortValueSetter, State, state_features, state_flags},
 };
+use log::warn;
 use lv2_raw::LV2Feature;
 use lv2_sys::LV2_Worker_Schedule;
 use ringbuf::HeapProd;
@@ -19,6 +23,7 @@ use ringbuf::HeapProd;
 #[derive(Clone)]
 pub struct Plugin {
     pub(crate) inner: lilv::plugin::Plugin,
+    pub(crate) world: Arc<lilv::World>,
     pub(crate) common_uris: Arc<CommonUris>,
     port_counts: PortCounts,
     classes: Vec<String>,
@@ -27,6 +32,7 @@ pub struct Plugin {
 impl Plugin {
     pub(crate) fn from_raw(
         plugin: lilv::plugin::Plugin,
+        world: Arc<lilv::World>,
         common_uris: Arc<CommonUris>,
         classes: Vec<String>,
     ) -> Plugin {
@@ -45,6 +51,7 @@ impl Plugin {
         }
         Plugin {
             inner: plugin,
+            world,
             common_uris,
             port_counts,
             classes,
@@ -85,7 +92,28 @@ impl Plugin {
     /// Returns an error if the plugin could not be instantiated.
     ///
     /// # Safety
-    /// Running plugin code is unsafe.
+    /// The caller must ensure that the plugin's native library and metadata
+    /// agree and that its code obeys the [LV2 contracts]. This includes valid
+    /// port indices and types, respecting buffer bounds and input immutability,
+    /// and using feature callbacks only with valid handles and payloads. Plugin
+    /// discovery filters unsupported features and ports; it does not establish
+    /// that native code is memory safe or isolate it from the host process.
+    ///
+    /// `sample_rate` must be finite, positive, and supported by the plugin.
+    /// Additional plugin-specific preconditions must also be satisfied.
+    ///
+    /// These guarantees must hold for the returned instance's entire lifetime,
+    /// including state operations, background worker callbacks, deactivation,
+    /// and cleanup. Workers may execute concurrently with audio processing;
+    /// the plugin must obey the [LV2 Worker threading rules]. Calls made outside
+    /// livi, including through raw handles, must obey LV2's threading rules and
+    /// must not invalidate the instance, its ports, or its feature data.
+    ///
+    /// The instance retains `features` and its plugin library. Callers do not
+    /// need to keep a separate `World`, `Plugin`, or `Arc<Features>` alive.
+    ///
+    /// [LV2 contracts]: https://lv2plug.in/ns/lv2core
+    /// [LV2 Worker threading rules]: https://lv2plug.in/ns/ext/worker
     pub unsafe fn instantiate(
         &self,
         features: Arc<Features>,
@@ -109,7 +137,7 @@ impl Plugin {
 
             let worker_schedule_ptr: *mut LV2_Worker_Schedule = worker_schedule.as_mut();
             let worker_feature = LV2Feature {
-                uri: lv2_sys::LV2_WORKER__schedule.as_ptr() as *mut i8,
+                uri: lv2_sys::LV2_WORKER__schedule.as_ptr().cast(),
                 data: worker_schedule_ptr.cast(),
             };
 
@@ -120,7 +148,11 @@ impl Plugin {
                 .instantiate(sample_rate, iter_features)
                 .ok_or(InstantiateError::UnknownError)?;
 
-            let control_inputs = Controls::new(self.ports_with_type(PortType::ControlInput));
+            let mut control_inputs = Controls::new(self.ports_with_type(PortType::ControlInput));
+            let control_input_symbols: HashMap<String, PortIndex> = self
+                .ports_with_type(PortType::ControlInput)
+                .map(|p| (p.symbol, p.index))
+                .collect();
             let control_outputs = Controls::new(self.ports_with_type(PortType::ControlOutput));
             let mut audio_inputs = Vec::new();
             let mut audio_outputs = Vec::new();
@@ -143,6 +175,32 @@ impl Plugin {
                 }
             }
 
+            if self
+                .inner
+                .has_feature(&self.common_uris.load_default_state_feature_uri)
+            {
+                let mut map = features.urid_map.lv2_urid_map();
+                match self.world.new_state(&mut map, &self.inner.uri()) {
+                    None => warn!(
+                        "Plugin {} requires loadDefaultState but its default state could not be loaded.",
+                        self.uri()
+                    ),
+                    Some(default_state) => {
+                        let mut setter = PortValueSetter {
+                            controls: &mut control_inputs,
+                            symbols: &control_input_symbols,
+                            features: &features,
+                        };
+                        default_state.restore(
+                            &instance,
+                            Some(&mut setter),
+                            state_flags(),
+                            state_features(&features),
+                        );
+                    }
+                }
+            }
+
             let mut inner = instance.activate();
             #[allow(clippy::mutex_atomic)]
             let is_alive = Arc::new(Mutex::new(true));
@@ -162,6 +220,8 @@ impl Plugin {
 
             Ok(Instance {
                 inner,
+                plugin: self.inner.clone(),
+                control_input_symbols,
                 min_block_size,
                 max_block_size,
                 control_inputs,
@@ -177,7 +237,7 @@ impl Plugin {
                 _worker_schedule: worker_schedule,
                 _instance_to_worker_sender: instance_to_worker_sender,
                 is_alive,
-                _features: features,
+                features,
             })
         }
     }
@@ -234,8 +294,16 @@ impl<'a> Debug for PortsDebug<'a> {
 }
 
 /// An instance of a plugin that can process inputs and outputs.
+///
+/// Created by [`Plugin::instantiate`], whose safety requirements also cover
+/// subsequent safe methods and destruction. Port buffers passed to [`Self::run`]
+/// are borrowed for that call; they need not remain alive between calls.
+/// Accessing the underlying instance through [`Self::raw`] or [`Self::raw_mut`]
+/// does not extend those buffer lifetimes.
 pub struct Instance {
     inner: lilv::instance::ActiveInstance,
+    plugin: lilv::plugin::Plugin,
+    control_input_symbols: HashMap<String, PortIndex>,
     min_block_size: usize,
     max_block_size: usize,
     control_inputs: Controls,
@@ -251,7 +319,7 @@ pub struct Instance {
     _worker_schedule: Box<lv2_sys::LV2_Worker_Schedule>,
     _instance_to_worker_sender: Box<worker::WorkerMessageSender>,
     is_alive: Arc<Mutex<bool>>,
-    _features: Arc<Features>,
+    features: Arc<Features>,
 }
 
 unsafe impl Sync for Instance {}
@@ -261,11 +329,75 @@ impl Instance {
     /// Run the plugin for a given number of samples.
     ///
     /// # Safety
-    /// Running plugin code is unsafe.
+    /// The lifetime-wide requirements of [`Plugin::instantiate`] must still
+    /// hold. In particular, the plugin must read only input buffers and write
+    /// only within output buffers, and must not access these buffers after this
+    /// call returns (including from background workers or during cleanup).
+    ///
+    /// Each iterator must report its exact remaining element count through
+    /// `ExactSizeIterator::len` and yield that many buffers. Buffers must be
+    /// supplied in ascending port-index order within each port type. Incorrect
+    /// iterator counts can leave stale pointers connected to the plugin.
+    ///
+    /// Atom buffers must use the same URID mapping as the `features` passed to
+    /// instantiation. Input sequences, event payloads, types, and timestamps must
+    /// satisfy the plugin's supported atom protocols. Any data modified through
+    /// raw pointers must remain well formed. The plugin must honor the capacity
+    /// advertised in output chunks and produce valid, bounded atom sequences
+    /// before those outputs are read or iterated. See the [LV2 Atom format].
+    ///
+    /// All buffers must remain valid for this entire call. Normal Rust borrows
+    /// provide validity and exclusive output access; any raw-pointer access must
+    /// preserve these guarantees too. No external code may run, reconnect,
+    /// deactivate, or destroy this instance concurrently. Background work
+    /// managed by livi is allowed under the LV2 Worker contract.
+    ///
+    /// [LV2 Atom format]: https://lv2plug.in/ns/ext/atom
     ///
     /// # Errors
-    /// Returns an error if the plugin could not be run.
+    /// Returns an error if `samples` is outside the configured block bounds,
+    /// a port iterator reports the wrong buffer count, or an audio/CV buffer has
+    /// fewer than `samples` elements. These checks do not validate atom payloads
+    /// or native plugin behavior. Validation may reconnect some ports and clear
+    /// atom outputs before returning an error, but does not call the plugin's
+    /// processing callback on that path.
     pub unsafe fn run<
+        'a,
+        AudioInputs,
+        AudioOutputs,
+        AtomSequenceInputs,
+        AtomSequenceOutputs,
+        CVInputs,
+        CVOutputs,
+    >(
+        &mut self,
+        samples: usize,
+        ports: PortConnections<
+            'a,
+            AudioInputs,
+            AudioOutputs,
+            AtomSequenceInputs,
+            AtomSequenceOutputs,
+            CVInputs,
+            CVOutputs,
+        >,
+    ) -> Result<(), RunError>
+    where
+        AudioInputs: ExactSizeIterator + Iterator<Item = &'a [f32]>,
+        AudioOutputs: ExactSizeIterator + Iterator<Item = &'a mut [f32]>,
+        AtomSequenceInputs: ExactSizeIterator + Iterator<Item = &'a LV2AtomSequence>,
+        AtomSequenceOutputs: ExactSizeIterator + Iterator<Item = &'a mut LV2AtomSequence>,
+        CVInputs: ExactSizeIterator + Iterator<Item = &'a [f32]>,
+        CVOutputs: ExactSizeIterator + Iterator<Item = &'a mut [f32]>,
+    {
+        unsafe { self.connect(samples, ports) }?;
+        unsafe { self.inner.run(samples) };
+        self.run_worker()?;
+
+        Ok(())
+    }
+
+    unsafe fn connect<
         'a,
         AudioInputs,
         AudioOutputs,
@@ -377,6 +509,12 @@ impl Instance {
                 });
             }
             for (data, index) in ports.cv_inputs.zip(self.cv_inputs.iter()) {
+                if data.len() < samples {
+                    return Err(RunError::CVInputSampleCountTooSmall {
+                        expected: samples,
+                        actual: data.len(),
+                    });
+                }
                 self.inner
                     .instance_mut()
                     .connect_port(index.0, data.as_ptr());
@@ -388,14 +526,18 @@ impl Instance {
                 });
             }
             for (data, index) in ports.cv_outputs.zip(self.cv_outputs.iter()) {
+                if data.len() < samples {
+                    return Err(RunError::CVOutputSampleCountTooSmall {
+                        expected: samples,
+                        actual: data.len(),
+                    });
+                }
                 self.inner
                     .instance_mut()
                     .connect_port_mut(index.0, data.as_mut_ptr());
             }
-            self.inner.run(samples);
-
-            self.run_worker()
         }
+        Ok(())
     }
 
     pub fn run_worker(&mut self) -> Result<(), RunError> {
@@ -412,11 +554,21 @@ impl Instance {
     }
 
     /// Get the underlying `lilv::instance::ActiveInstance`.
+    ///
+    /// Its port pointers may refer to buffers from an earlier [`Self::run`]
+    /// call whose borrows have ended. Before running through this interface,
+    /// reconnect every audio, CV, and atom port to valid buffers and uphold the
+    /// underlying unsafe API's requirements. Do not free the handle or invalidate
+    /// livi's control-port connections or feature data.
     pub fn raw(&self) -> &lilv::instance::ActiveInstance {
         &self.inner
     }
 
     /// Get the underlying `lilv::instance::ActiveInstance`.
+    ///
+    /// The same port-lifetime and ownership requirements as [`Self::raw`] apply.
+    /// Raw operations must preserve the active instance and livi's control-port
+    /// connections. A later [`Self::run`] reconnects audio, CV, and atom ports.
     pub fn raw_mut(&mut self) -> &mut lilv::instance::ActiveInstance {
         &mut self.inner
     }
@@ -456,6 +608,64 @@ impl Instance {
         Some(unsafe { *ptr })
     }
 
+    /// Take a snapshot of the instance's state. This includes the values of all
+    /// control input ports and any properties the plugin saves through the LV2
+    /// State extension.
+    ///
+    /// # Errors
+    /// Returns an error if the state could not be created.
+    pub fn state(&self) -> Result<State, StateError> {
+        let mut map = self.features.urid_map.lv2_urid_map();
+        let mut getter = PortValueGetter {
+            controls: &self.control_inputs,
+            symbols: &self.control_input_symbols,
+            float_urid: self
+                .features
+                .urid(CStr::from_bytes_with_nul(lv2_sys::LV2_ATOM__Float).unwrap()),
+        };
+        let inner = self
+            .plugin
+            .new_state_from_instance(
+                self.inner.instance(),
+                &mut map,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut getter),
+                state_flags(),
+                state_features(&self.features),
+            )
+            .ok_or(StateError::CreateFailed)?;
+        Ok(State::new(inner, self.features.clone()))
+    }
+
+    /// Restore the instance to `state`. This sets the values of the control
+    /// input ports and restores any properties the plugin saves through the LV2
+    /// State extension.
+    ///
+    /// # Errors
+    /// Returns an error if `state` is for a different plugin.
+    pub fn restore_state(&mut self, state: &State) -> Result<(), StateError> {
+        let expected = self.plugin.uri().as_uri().unwrap_or_default().to_string();
+        let actual = state.plugin_uri();
+        if expected != actual {
+            return Err(StateError::PluginMismatch { expected, actual });
+        }
+        let mut setter = PortValueSetter {
+            controls: &mut self.control_inputs,
+            symbols: &self.control_input_symbols,
+            features: &self.features,
+        };
+        state.raw().restore(
+            self.inner.instance(),
+            Some(&mut setter),
+            state_flags(),
+            state_features(&self.features),
+        );
+        Ok(())
+    }
+
     /// Get the number of ports for a specific type of port.
     pub fn port_counts_for_type(&self, t: PortType) -> usize {
         match t {
@@ -491,6 +701,7 @@ impl Debug for Instance {
             .field("plugin", &self.inner.instance().uri())
             .field("min_block_size", &self.min_block_size)
             .field("max_block_size", &self.max_block_size)
+            .field("control_input_symbols", &self.control_input_symbols)
             .field("control_inputs", &self.control_inputs)
             .field("control_outputs", &self.control_outputs)
             .field("audio_inputs", &self.audio_inputs)
@@ -504,7 +715,7 @@ impl Debug for Instance {
             .field("_worker_schedule", &self._worker_schedule)
             .field("_instance_to_worker_sender", &"__ringbuf_sender__")
             .field("is_alive", &self.is_alive)
-            .field("_features", &self._features)
+            .field("features", &self.features)
             .finish()
     }
 }
@@ -591,6 +802,46 @@ fn node_to_value(maybe_node: &Option<lilv::node::Node>) -> f32 {
 #[cfg(test)]
 mod tests {
     use crate::{Port, PortCounts, PortIndex, PortType};
+
+    #[test]
+    fn cv_buffer_lengths_are_validated_before_running() {
+        let fixture = crate::test_support::Fixture::new(
+            r#"
+            lv2:port
+                [ a lv2:InputPort, lv2:CVPort; lv2:index 0; lv2:symbol "in"; lv2:name "In" ],
+                [ a lv2:OutputPort, lv2:CVPort; lv2:index 1; lv2:symbol "out"; lv2:name "Out" ],
+                [ a lv2:OutputPort, lv2:ControlPort; lv2:index 2; lv2:symbol "runs"; lv2:name "Runs" ]
+        "#,
+        );
+        let world = crate::World::with_load_bundle(&fixture.bundle_uri);
+        let plugin = world.plugin_by_uri("urn:livi:test").unwrap();
+        let features = world
+            .try_build_features(crate::FeaturesBuilder::default())
+            .expect("invalid feature block bounds");
+        let mut instance = unsafe { plugin.instantiate(features, 44100.0).unwrap() };
+        for (input_size, output_size) in [
+            (0, 256),
+            (255, 256),
+            (256, 0),
+            (256, 255),
+            (256, 256),
+            (300, 300),
+        ] {
+            let input = vec![0.0; input_size];
+            let mut output = vec![0.0; output_size];
+            let ports = crate::EmptyPortConnections::new()
+                .with_cv_inputs(std::iter::once(input.as_slice()))
+                .with_cv_outputs(std::iter::once(output.as_mut_slice()));
+            let result = unsafe { instance.run(256, ports) };
+            assert_eq!(
+                result.is_err(),
+                input_size < 256 || output_size < 256,
+                "input {input_size}, output {output_size}: {result:?}"
+            );
+        }
+        // Only the two valid runs may invoke plugin code.
+        assert_eq!(instance.control_output(PortIndex(2)), Some(2.0));
+    }
 
     #[test]
     fn test_metadata() {
@@ -772,10 +1023,12 @@ mod tests {
         let plugin = world
             .plugin_by_uri("http://drobilla.net/plugins/mda/EPiano")
             .expect("Plugin not found.");
-        let features = world.build_features(crate::features::FeaturesBuilder {
-            min_block_length: block_size,
-            max_block_length: block_size,
-        });
+        let features = world
+            .try_build_features(crate::features::FeaturesBuilder {
+                min_block_length: block_size,
+                max_block_length: block_size,
+            })
+            .expect("invalid feature block bounds");
         let mut instance = unsafe {
             plugin
                 .instantiate(features.clone(), sample_rate)
@@ -807,10 +1060,12 @@ mod tests {
         let plugin = world
             .plugin_by_uri("http://drobilla.net/plugins/mda/EPiano")
             .expect("Plugin not found.");
-        let features = world.build_features(crate::features::FeaturesBuilder {
-            min_block_length: supported_block_size.0,
-            max_block_length: supported_block_size.1,
-        });
+        let features = world
+            .try_build_features(crate::features::FeaturesBuilder {
+                min_block_length: supported_block_size.0,
+                max_block_length: supported_block_size.1,
+            })
+            .expect("invalid feature block bounds");
         let mut instance = unsafe {
             plugin
                 .instantiate(features, 44100.0)
@@ -834,10 +1089,12 @@ mod tests {
         let plugin = world
             .plugin_by_uri("http://drobilla.net/plugins/mda/EPiano")
             .expect("Plugin not found.");
-        let features = world.build_features(crate::features::FeaturesBuilder {
-            min_block_length: supported_block_size.0,
-            max_block_length: supported_block_size.1,
-        });
+        let features = world
+            .try_build_features(crate::features::FeaturesBuilder {
+                min_block_length: supported_block_size.0,
+                max_block_length: supported_block_size.1,
+            })
+            .expect("invalid feature block bounds");
         let mut instance = unsafe {
             plugin
                 .instantiate(features, 44100.0)

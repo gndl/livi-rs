@@ -2,7 +2,7 @@
 //! ```
 //! let world = livi::World::new();
 //! const SAMPLE_RATE: f64 = 44100.0;
-//! let features = world.build_features(livi::FeaturesBuilder::default());
+//! let features = world.try_build_features(livi::FeaturesBuilder::default()).expect("invalid feature block bounds");
 //! let plugin = world
 //!     // This is the URI for mda EPiano. You can use the `lv2ls` command line
 //!     // utility to see all available LV2 plugins.
@@ -36,13 +36,16 @@
 //!     .with_audio_outputs(outputs.iter_mut().map(|output| output.as_mut_slice()));
 //! unsafe { instance.run(features.max_block_length(), ports).unwrap() };
 //! ```
+use error::StateError;
 use log::{debug, error, info, warn};
+use std::path::Path;
 use std::sync::Arc;
 
 pub use features::worker::{Worker, WorkerManager};
 pub use features::{Features, FeaturesBuilder};
 pub use plugin::{Instance, Plugin};
 pub use port::{EmptyPortConnections, Port, PortConnections, PortCounts, PortIndex, PortType};
+pub use state::State;
 
 /// The underlying `lilv` library.
 pub use lilv;
@@ -55,10 +58,14 @@ pub mod event;
 mod features;
 mod plugin;
 mod port;
+/// Contains support for saving and restoring plugin state.
+pub mod state;
 
 /// Contains all plugins.
 pub struct World {
-    world: lilv::World,
+    // TODO: Remove the Arc once lilv::World implements Clone. lilv::World is
+    // already reference counted internally.
+    world: Arc<lilv::World>,
     livi_plugins: Vec<Plugin>,
 }
 
@@ -76,24 +83,13 @@ impl World {
     /// bundle_uri must be a fully qualified URI to the bundle directory,
     /// with the trailing slash, eg file:///usr/lib/lv2/foo.lv2/.
     pub fn with_load_bundle(bundle_uri: &str) -> World {
-        let world = lilv::World::new();
+        let world = Arc::new(lilv::World::new());
         let uri = world.new_uri(bundle_uri);
         world.load_bundle(&uri);
-        let common_uris = Arc::new(CommonUris::new(&world));
-        let class_to_parent = class_utils::make_class_to_parent_map(&world);
-        let plugins: Vec<Plugin> = world
-            .plugins()
-            .into_iter()
-            .map(|p| {
-                let classes = class_utils::class_with_parents(&p.class(), &class_to_parent);
-                Plugin::from_raw(p, common_uris.clone(), classes)
-            })
-            .collect();
-
-        World {
-            world,
-            livi_plugins: plugins,
+        fn any_plugin_pred(_: &Plugin) -> bool {
+            true
         }
+        Self::from_loaded_world(world, any_plugin_pred)
     }
 
     /// Get the underlying lilv world.
@@ -108,7 +104,16 @@ impl World {
     where
         P: Fn(&Plugin) -> bool,
     {
-        let world = lilv::World::with_load_all();
+        let world = Arc::new(lilv::World::with_load_all());
+        Self::from_loaded_world(world, predicate)
+    }
+
+    // Apply the same validation before constructing a Plugin, regardless of
+    // how the underlying world was populated.
+    fn from_loaded_world<P>(world: Arc<lilv::World>, plugin_predicate: P) -> World
+    where
+        P: Fn(&Plugin) -> bool,
+    {
         let common_uris = Arc::new(CommonUris::new(&world));
         let supported_features = crate::Features::supported_features();
         info!(
@@ -116,11 +121,16 @@ impl World {
             supported_features
         );
         let class_to_parent = class_utils::make_class_to_parent_map(&world);
+        // TODO: Collect list of warnings per plugin instead of just displaying one.
         let plugins: Vec<Plugin> = world
             .plugins()
             .into_iter()
             .filter(|p| {
-                let unsupported_features: Vec<_> = p.required_features().into_iter().filter(|f| !supported_features.contains(f.as_uri().unwrap_or(""))).collect();
+                let unsupported_features: Vec<_> = p
+                    .required_features()
+                    .into_iter()
+                    .filter(|f| !supported_features.contains(f.as_uri().unwrap_or("")))
+                    .collect();
                 let is_supported = unsupported_features.is_empty();
                 if !is_supported {
                     warn!(
@@ -142,46 +152,13 @@ impl World {
                 }
                 true
             })
-            .filter(|p| {
-                for port in p.iter_ports() {
-                    for class in port.classes() {
-                        if class != common_uris.input_port_uri
-                            && class != common_uris.output_port_uri
-                            && class != common_uris.audio_port_uri
-                            && class != common_uris.control_port_uri
-                            && class != common_uris.atom_port_uri
-                            && class != common_uris.cv_port_uri
-                            && class != common_uris.mod_cv_port_uri
-                        {
-                            error!("Port class {:?} is not supported.", class);
-                            return false;
-                        }
-                    }
-                    if !port.is_a(&common_uris.input_port_uri)
-                        && !port.is_a(&common_uris.output_port_uri)
-                    {
-                        error!(
-                            "Port {:?} for plugin {} is neither an input or output.",
-                            port,
-                            p.uri().as_str().unwrap_or("BAD_URI")
-                        );
-                        return false;
-                    }
-                    if !port.is_a(&common_uris.audio_port_uri) && !port.is_a(&common_uris.control_port_uri) && !port.is_a(&common_uris.atom_port_uri) && !port.is_a(&common_uris.cv_port_uri) {
-                        error!(
-                            "Port {:?}for plugin {} not a recognized data type. Supported types are Audio and Control", port, p.uri().as_str().unwrap_or("BAD_URI")
-                        );
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|p| ports_supported(p, &common_uris))
             .map(|p| {
                 let classes = class_utils::class_with_parents(&p.class(), &class_to_parent);
-                Plugin::from_raw(p, common_uris.clone(), classes)
-    })
+                Plugin::from_raw(p, world.clone(), common_uris.clone(), classes)
+            })
             .filter(|p| {
-                let keep = predicate(p);
+                let keep = plugin_predicate(p);
                 if !keep {
                     debug!("Ignoring plugin {} due to predicate.", p.uri());
                 }
@@ -206,15 +183,133 @@ impl World {
         self.iter_plugins().find(|p| p.uri() == uri)
     }
 
-    /// Initialize the block length. This is the minimum and maximum number of
-    /// samples that are processed per `run` method. This must be called before
-    /// any plugins are instantiated and may only be called once.
+    /// Build plugin features.
+    ///
+    /// # Panics
+    /// Panics if the block bounds are invalid. Use `try_build_features` to
+    /// receive a configuration error instead.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use try_build_features to handle invalid block bounds"
+    )]
+    pub fn build_features(&self, builder: crate::features::FeaturesBuilder) -> Arc<Features> {
+        self.try_build_features(builder)
+            .expect("invalid feature block bounds")
+    }
+
+    /// Build plugin features, returning an error for invalid block bounds.
+    pub fn try_build_features(
+        &self,
+        builder: FeaturesBuilder,
+    ) -> Result<Arc<Features>, error::FeatureError> {
+        builder.try_build(self)
+    }
+
+    /// Load a state from a string, such as one produced by `State::to_string`.
     ///
     /// # Errors
-    /// Returns an error if the block lengths are invalid.
-    pub fn build_features(&self, builder: crate::features::FeaturesBuilder) -> Arc<Features> {
-        builder.build(self)
+    /// Returns an error if the state could not be loaded.
+    pub fn state_from_string(
+        &self,
+        features: &Arc<Features>,
+        state: &str,
+    ) -> Result<State, StateError> {
+        let mut map = features.urid_map.lv2_urid_map();
+        let inner = self
+            .world
+            .new_state_from_string(&mut map, state)
+            .ok_or(StateError::LoadFailed)?;
+        Ok(State::new(inner, features.clone()))
     }
+
+    /// Load a state from a Turtle file, such as one produced by `State::save`.
+    /// If `uri` is `None`, then the subject of the state is taken to be the
+    /// file itself.
+    ///
+    /// # Errors
+    /// Returns an error if `path` is not valid UTF-8 or the state could not be
+    /// loaded.
+    pub fn state_from_file(
+        &self,
+        features: &Arc<Features>,
+        uri: Option<&str>,
+        path: &Path,
+    ) -> Result<State, StateError> {
+        let path = path.to_str().ok_or(StateError::InvalidPath)?;
+        let mut map = features.urid_map.lv2_urid_map();
+        let subject = uri.map(|uri| self.world.new_uri(uri));
+        let inner = self
+            .world
+            .new_state_from_file(&mut map, subject.as_ref(), path)
+            .ok_or(StateError::LoadFailed)?;
+        Ok(State::new(inner, features.clone()))
+    }
+
+    /// Load a state, such as a preset, that has been loaded into the world. If
+    /// `uri` is a plugin URI, then the default state of the plugin is loaded.
+    ///
+    /// # Errors
+    /// Returns an error if the state could not be loaded.
+    pub fn state_from_uri(&self, features: &Arc<Features>, uri: &str) -> Result<State, StateError> {
+        let mut map = features.urid_map.lv2_urid_map();
+        let inner = self
+            .world
+            .new_state(&mut map, &self.world.new_uri(uri))
+            .ok_or(StateError::LoadFailed)?;
+        Ok(State::new(inner, features.clone()))
+    }
+}
+
+fn ports_supported(plugin: &lilv::plugin::Plugin, uris: &CommonUris) -> bool {
+    let direction_classes = [&uris.input_port_uri, &uris.output_port_uri];
+    let data_classes = [
+        &uris.audio_port_uri,
+        &uris.control_port_uri,
+        &uris.atom_port_uri,
+        &uris.cv_port_uri,
+    ];
+
+    plugin.iter_ports().all(|port| {
+        for class in port.classes() {
+            if !direction_classes.contains(&&class)
+                && !data_classes.contains(&&class)
+                && class != uris.mod_cv_port_uri
+            {
+                error!("Port class {:?} is not supported.", class);
+                return false;
+            }
+        }
+        if !direction_classes.iter().any(|class| port.is_a(class)) {
+            error!(
+                "Port {:?} for plugin {} is neither an input nor output.",
+                port,
+                plugin.uri().as_str().unwrap_or("BAD_URI")
+            );
+            return false;
+        }
+        if !data_classes.iter().any(|class| port.is_a(class)) {
+            error!(
+                "Port {:?} for plugin {} is not a recognized data type. \
+                 Supported types are Audio, Control, Atom and CV",
+                port,
+                plugin.uri().as_str().unwrap_or("BAD_URI")
+            );
+            return false;
+        }
+        if port.is_a(&uris.atom_port_uri)
+            && !port
+                .value(&uris.atom_buffer_type_uri)
+                .into_iter()
+                .any(|value| value == uris.atom_sequence_uri)
+        {
+            warn!(
+                "Plugin {:?} has an atom port without Sequence buffer support",
+                plugin.uri()
+            );
+            return false;
+        }
+        true
+    })
 }
 
 impl Default for World {
@@ -238,9 +333,12 @@ struct CommonUris {
     control_port_uri: lilv::node::Node,
     audio_port_uri: lilv::node::Node,
     atom_port_uri: lilv::node::Node,
+    atom_buffer_type_uri: lilv::node::Node,
+    atom_sequence_uri: lilv::node::Node,
     cv_port_uri: lilv::node::Node,
     mod_cv_port_uri: lilv::node::Node,
     worker_schedule_feature_uri: lilv::node::Node,
+    load_default_state_feature_uri: lilv::node::Node,
 }
 
 impl CommonUris {
@@ -251,9 +349,13 @@ impl CommonUris {
             control_port_uri: world.new_uri("http://lv2plug.in/ns/lv2core#ControlPort"),
             audio_port_uri: world.new_uri("http://lv2plug.in/ns/lv2core#AudioPort"),
             atom_port_uri: world.new_uri("http://lv2plug.in/ns/ext/atom#AtomPort"),
+            atom_buffer_type_uri: world.new_uri("http://lv2plug.in/ns/ext/atom#bufferType"),
+            atom_sequence_uri: world.new_uri("http://lv2plug.in/ns/ext/atom#Sequence"),
             cv_port_uri: world.new_uri("http://lv2plug.in/ns/lv2core#CVPort"),
             mod_cv_port_uri: world.new_uri("http://moddevices.com/ns/mod#CVPort"),
             worker_schedule_feature_uri: world.new_uri("http://lv2plug.in/ns/ext/worker#schedule"),
+            load_default_state_feature_uri: world
+                .new_uri("http://lv2plug.in/ns/ext/state#loadDefaultState"),
         }
     }
 }
@@ -271,12 +373,76 @@ mod tests {
     const SAMPLE_RATE: f64 = 44100.0;
 
     #[test]
+    fn atom_ports_require_sequence_buffer_type() {
+        for (declaration, supported) in [
+            ("atom:bufferType atom:Float;", false),
+            ("", false),
+            ("atom:bufferType atom:Sequence;", true),
+            ("atom:bufferType atom:Float, atom:Sequence;", true),
+        ] {
+            let fixture = crate::test_support::Fixture::new(&format!(
+                r#"
+                lv2:port [ a lv2:InputPort, atom:AtomPort; lv2:index 0;
+                    lv2:symbol "atom"; lv2:name "Atom"; {declaration} ]
+            "#
+            ));
+            let world = World::with_load_bundle(&fixture.bundle_uri);
+            assert_eq!(
+                world.plugin_by_uri("urn:livi:test").is_some(),
+                supported,
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_loading_rejects_unsupported_features() {
+        let fixture =
+            crate::test_support::Fixture::new("lv2:requiredFeature <urn:livi:unsupported>");
+        assert_eq!(
+            World::with_load_bundle(&fixture.bundle_uri)
+                .iter_plugins()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn bundle_loading_rejects_unsupported_ports() {
+        let fixture = crate::test_support::Fixture::new(
+            r#"
+            lv2:port [ a lv2:InputPort, <http://lv2plug.in/ns/ext/event#EventPort>;
+                lv2:index 0; lv2:symbol "event"; lv2:name "Event" ]
+        "#,
+        );
+        assert_eq!(
+            World::with_load_bundle(&fixture.bundle_uri)
+                .iter_plugins()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn bundle_loading_accepts_supported_plugins() {
+        let fixture =
+            crate::test_support::Fixture::new("lv2:optionalFeature <urn:livi:unsupported>");
+        assert!(
+            World::with_load_bundle(&fixture.bundle_uri)
+                .plugin_by_uri("urn:livi:test")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn test_midi_urid_ok() {
         let world = World::new();
-        let features = world.build_features(crate::features::FeaturesBuilder {
-            min_block_length: MIN_BLOCK_SIZE,
-            max_block_length: MAX_BLOCK_SIZE,
-        });
+        let features = world
+            .try_build_features(crate::features::FeaturesBuilder {
+                min_block_length: MIN_BLOCK_SIZE,
+                max_block_length: MAX_BLOCK_SIZE,
+            })
+            .expect("invalid feature block bounds");
         assert!(features.midi_urid() > 0, "midi urid is not valid");
     }
 
@@ -284,10 +450,12 @@ mod tests {
     fn test_all() {
         let world = World::new();
         let block_size = 64;
-        let features = world.build_features(crate::features::FeaturesBuilder {
-            min_block_length: block_size,
-            max_block_length: block_size,
-        });
+        let features = world
+            .try_build_features(crate::features::FeaturesBuilder {
+                min_block_length: block_size,
+                max_block_length: block_size,
+            })
+            .expect("invalid feature block bounds");
         for plugin in world.iter_plugins() {
             if plugin
                 .uri()
@@ -372,10 +540,12 @@ mod tests {
                 cv_outputs: 0,
             }
         );
-        let features = world.build_features(FeaturesBuilder {
-            min_block_length: MIN_BLOCK_SIZE,
-            max_block_length: MAX_BLOCK_SIZE,
-        });
+        let features = world
+            .try_build_features(FeaturesBuilder {
+                min_block_length: MIN_BLOCK_SIZE,
+                max_block_length: MAX_BLOCK_SIZE,
+            })
+            .expect("invalid feature block bounds");
         let mut instance = unsafe {
             plugin
                 .instantiate(features.clone(), SAMPLE_RATE)
@@ -437,10 +607,12 @@ mod tests {
                 cv_outputs: 0,
             }
         );
-        let features = world.build_features(FeaturesBuilder {
-            min_block_length: block_size,
-            max_block_length: block_size,
-        });
+        let features = world
+            .try_build_features(FeaturesBuilder {
+                min_block_length: block_size,
+                max_block_length: block_size,
+            })
+            .expect("invalid feature block bounds");
         let mut instance = unsafe {
             plugin
                 .instantiate(features.clone(), SAMPLE_RATE)
@@ -524,7 +696,11 @@ mod tests {
             "http://lv2plug.in/ns/ext/options#options",
             "http://lv2plug.in/ns/ext/buf-size#boundedBlockLength",
             "http://lv2plug.in/ns/ext/worker#schedule",
+            "http://lv2plug.in/ns/ext/state#loadDefaultState",
         ]);
         assert_eq!(want, supported_features);
     }
 }
+
+#[cfg(test)]
+mod test_support;

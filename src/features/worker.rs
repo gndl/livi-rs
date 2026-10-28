@@ -38,32 +38,44 @@ fn publish_message(
     if size > MAX_MESSAGE_SIZE {
         return lv2_sys::LV2_Worker_Status_LV2_WORKER_ERR_NO_SPACE;
     }
-    let mut body = unsafe { slice::from_raw_parts(body, size) };
+    let body = if size == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(body, size) }
+    };
     let total_size = size_of::<usize>() + size;
-    if sender.vacant_len() < total_size {
-        return lv2_sys::LV2_Worker_Status_LV2_WORKER_ERR_NO_SPACE;
-    }
     let size_as_bytes = size.to_be_bytes();
-    sender.push_slice(&size_as_bytes);
-    let result = sender.read_from(&mut body, Some(size));
-    match result {
-        Some(_) => lv2_sys::LV2_Worker_Status_LV2_WORKER_SUCCESS,
-        None => lv2_sys::LV2_Worker_Status_LV2_WORKER_ERR_UNKNOWN,
-    }
+    let send_result = if sender.vacant_len() < total_size {
+        return lv2_sys::LV2_Worker_Status_LV2_WORKER_ERR_NO_SPACE;
+    } else {
+        sender.push_iter(size_as_bytes.iter().chain(body.iter()).copied())
+    };
+    // PANIC OK: We ensure capacity above so this should never panic.
+    assert_eq!(send_result, total_size);
+    lv2_sys::LV2_Worker_Status_LV2_WORKER_SUCCESS
 }
 
 fn pop_message(receiver: &mut WorkerMessageReceiver) -> WorkerMessage {
     let mut size_as_bytes = [0; size_of::<usize>()];
-    receiver.pop_slice(&mut size_as_bytes);
+    assert_eq!(receiver.pop_slice(&mut size_as_bytes), size_as_bytes.len());
     let size = usize::from_be_bytes(size_as_bytes);
     let mut body: MessageBody = [0; MAX_MESSAGE_SIZE];
-    let mut slice = &mut body[..];
-    let _ = receiver.write_into(&mut slice, Some(size)).unwrap();
+    assert_eq!(receiver.pop_slice(&mut body[..size]), size);
 
     WorkerMessage { size, body }
 }
 
-pub extern "C" fn schedule_work(
+/// Queue a worker message from an LV2 audio-context callback.
+///
+/// # Safety
+/// `handle` must be the live schedule handle supplied by livi to this plugin
+/// instance. Calls using that handle must be serialized and confined to the
+/// calling contexts allowed by the LV2 Worker extension. For a nonzero `size`
+/// within the supported message limit, `body` must point to at least `size`
+/// initialized, readable bytes for the duration of this call. A zero-size
+/// message may use a null body pointer. Neither pointer is retained as message
+/// data: the payload is copied into the queue.
+pub unsafe extern "C" fn schedule_work(
     handle: lv2_sys::LV2_Worker_Schedule_Handle,
     size: u32,
     body: *const c_void,
@@ -124,7 +136,7 @@ impl Worker {
     /// the results back to the realtime thread.
     pub fn do_work(&mut self) {
         let plugin_is_alive = self.plugin_is_alive.lock().unwrap();
-        while *plugin_is_alive && self.receiver.occupied_len() > size_of::<usize>() {
+        while *plugin_is_alive && self.receiver.occupied_len() >= size_of::<usize>() {
             let mut message = pop_message(&mut self.receiver);
             if let Some(work_function) = self.interface.work {
                 let sender = &mut self.sender as *mut WorkerMessageSender as *mut c_void;
@@ -196,7 +208,7 @@ pub(crate) fn handle_work_responses(
     receiver: &mut WorkerMessageReceiver,
     handle: lv2_sys::LV2_Handle,
 ) {
-    while receiver.occupied_len() > size_of::<usize>() {
+    while receiver.occupied_len() >= size_of::<usize>() {
         let mut message = pop_message(receiver);
         if let Some(work_response_function) = worker_interface.work_response {
             unsafe { work_response_function(handle, message.size as u32, message.data()) };
@@ -231,10 +243,10 @@ pub(crate) fn end_run(
 /// # let plugin = world
 /// #     .plugin_by_uri("http://drobilla.net/plugins/mda/EPiano")
 /// #     .expect("Plugin not found.");
-/// let features = world.build_features(livi::FeaturesBuilder{
+/// let features = world.try_build_features(livi::FeaturesBuilder{
 ///     min_block_length: MIN_BLOCK_SIZE,
 ///     max_block_length: MAX_BLOCK_SIZE,
-/// });
+/// }).expect("invalid feature block bounds");
 /// let mut instance = unsafe {
 ///     plugin
 ///         .instantiate(features.clone(), SAMPLE_RATE)
@@ -275,6 +287,104 @@ impl WorkerManager {
 mod tests {
     use super::*;
     use std::str;
+
+    #[test]
+    fn empty_worker_messages() {
+        unsafe extern "C" fn count_work(
+            handle: lv2_sys::LV2_Handle,
+            _respond: lv2_sys::LV2_Worker_Respond_Function,
+            _respond_handle: lv2_sys::LV2_Worker_Respond_Handle,
+            size: u32,
+            _data: *const c_void,
+        ) -> lv2_sys::LV2_Worker_Status {
+            assert_eq!(size, 0);
+            unsafe {
+                *(handle as *mut usize) += 1;
+            }
+            lv2_sys::LV2_Worker_Status_LV2_WORKER_SUCCESS
+        }
+
+        unsafe extern "C" fn count_response(
+            handle: lv2_sys::LV2_Handle,
+            size: u32,
+            _data: *const c_void,
+        ) -> lv2_sys::LV2_Worker_Status {
+            assert_eq!(size, 0);
+            unsafe {
+                *(handle as *mut usize) += 1;
+            }
+            lv2_sys::LV2_Worker_Status_LV2_WORKER_SUCCESS
+        }
+
+        let (mut sender, receiver) = instantiate_queue();
+        let (response_sender, mut response_receiver) = instantiate_queue();
+        let mut count = 0usize;
+        let handle = (&mut count as *mut usize).cast();
+        let mut interface = lv2_sys::LV2_Worker_Interface {
+            work: Some(count_work),
+            work_response: Some(count_response),
+            end_run: None,
+        };
+        let mut worker = Worker::new(
+            Arc::new(Mutex::new(true)),
+            interface,
+            handle,
+            receiver,
+            response_sender,
+        );
+        for data in [
+            std::ptr::NonNull::<u8>::dangling().as_ptr(),
+            std::ptr::null_mut(),
+        ] {
+            assert_eq!(
+                publish_message(&mut sender, 0, data),
+                lv2_sys::LV2_Worker_Status_LV2_WORKER_SUCCESS
+            );
+            worker.do_work();
+            assert_eq!(worker.receiver.occupied_len(), 0);
+            assert_eq!(
+                publish_message(&mut worker.sender, 0, data),
+                lv2_sys::LV2_Worker_Status_LV2_WORKER_SUCCESS
+            );
+            handle_work_responses(&mut interface, &mut response_receiver, handle);
+            assert_eq!(response_receiver.occupied_len(), 0);
+        }
+        assert_eq!(count, 4);
+        let mut byte = 42;
+        assert_eq!(
+            publish_message(&mut sender, 1, &mut byte),
+            lv2_sys::LV2_Worker_Status_LV2_WORKER_SUCCESS
+        );
+        let message = pop_message(&mut worker.receiver);
+        assert_eq!(&message.body[..message.size], &[42]);
+    }
+
+    #[test]
+    fn worker_request_and_response_wraparound() {
+        for callback in [
+            schedule_work as unsafe extern "C" fn(_, _, _) -> _,
+            worker_respond,
+        ] {
+            let (mut sender, mut receiver) = instantiate_queue();
+            for round in 0..12u8 {
+                let data = [round + 1; MAX_MESSAGE_SIZE];
+                assert_eq!(
+                    unsafe {
+                        callback(
+                            (&mut sender as *mut WorkerMessageSender).cast(),
+                            data.len() as u32,
+                            data.as_ptr().cast(),
+                        )
+                    },
+                    lv2_sys::LV2_Worker_Status_LV2_WORKER_SUCCESS
+                );
+                let message = pop_message(&mut receiver);
+                assert_eq!(message.size, data.len());
+                assert!(message.body == data, "corrupted message {round}");
+                assert_eq!(receiver.occupied_len(), 0);
+            }
+        }
+    }
 
     #[test]
     fn test_send() {
